@@ -1,0 +1,1132 @@
+"""
+Stage 3 — Entropy-Conditioned Dual-Mode Reasoning with Learnable θ_low (Option B).
+
+Identical to adaptive_thinking_residual_w9.py except theta_low is an nn.Parameter
+trained end-to-end alongside GRPO via REINFORCE:
+
+  p_latent = sigmoid(alpha * (theta_low - entropy))   # alpha=5.0 fixed
+  theta_loss = -adv_mean * mean_over_boundaries(log π(decision | entropy, theta))
+
+The warmup schedule sets _warmup_scale (0→1) rather than overwriting theta_low
+directly, so gradients flow through theta_low_param from the first active step.
+
+New CLI args vs w9:
+  --theta_low_lr     LR for theta_low_param (default 1e-4, ~20x base LR)
+  --theta_low_weight Scale factor on theta_loss (default 0.1)
+  --theta_low_alpha  Sigmoid temperature (default 5.0, keep fixed)
+
+Usage:
+  accelerate launch adaptive_thinking_residual_w9_optB.py \\
+      --sft_checkpoint  <stage1.5_ckpt/model.pt> \\
+      --output_dir      /scratch/.../stage3_grpo_optB \\
+      --theta_low_lr    1e-4 \\
+      --theta_low_weight 0.1
+
+  # Resume
+  RESUME=1 bash week11tests/sh_stage3_grpo_w9_optB.sh
+"""
+
+import os
+import pathlib
+import types
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import TrainerCallback
+from trl import TrlParser
+
+from genomorph.dna_modules import NucleotideDNAModule
+from genomorph.models.dna_llm import DNALLMModel
+from genomorph.models.evo2_tokenizer import register_evo2_tokenizer
+from genomorph.models.thinking_residual import (
+    ThinkingResidualGate,
+    make_thinking_residual_param_groups,
+)
+from genomorph.trainer import DNALLMGRPOConfig, DNALLMGRPOTrainer
+
+from adaptive_latent_grpo import (
+    GRPOModelConfig,
+    GRPOScriptArguments,
+    SaveWithPyTorchCallback,
+    _load_sft_checkpoint,
+    _prep_for_training,
+    get_kegg_dataset,
+    reward_funcs_registry,
+)
+from adaptive_latent_grpo import (
+    ManifoldGateW6,
+    _build_u_dna,
+    make_ot_reward_func,
+)
+from adaptive_thinking_residual import (
+    GateWarmupCallback,
+    ThinkingResidualGRPOTrainer,
+    _make_tr_gate_loss,
+)
+# Import unchanged w9 components.
+# _make_dual_mode_generate_w9 closes over latentSp_ctrl and calls
+# latentSp_ctrl.is_latent_step() / is_dna_inject() — duck-typed, so our
+# LatentSpControllerOptB works without touching the generation loop.
+from train_grpo_latent_reasoning import (
+    MAX_GATE_FACTOR,
+    GRPOScriptArgumentsW9,
+    DNAHiddenInjector,
+    _make_dual_mode_generate_w9,
+    _make_dual_mode_forward_w9,
+    _make_tr_gate_loss_w9,
+    SaveGateAndInjectorCallback,
+    make_latent_usage_reward_func,
+    patch_model_for_dual_mode_w9,
+    _apply_dna_cache,
+    _LATENT_START_TOKEN,
+    _LATENT_END_TOKEN,
+    _LATENT_PAD_TOKEN,
+)
+
+register_evo2_tokenizer()
+
+
+# ── Extended script args ───────────────────────────────────────────────────────
+
+@dataclass
+class GRPOScriptArgumentsOptB(GRPOScriptArgumentsW9):
+    """Adds REINFORCE fields for learnable theta_low on top of all w9 args."""
+
+    theta_low_lr: float = field(
+        default=1e-4,
+        metadata={"help": "LR for theta_low_param in its own AdamW param group. "
+                          "~20x the base LR is a reasonable starting point since "
+                          "the REINFORCE signal is sparse (one update per step)."},
+    )
+    theta_low_weight: float = field(
+        default=0.1,
+        metadata={"help": "Coefficient on the REINFORCE theta_loss added to the main "
+                          "GRPO loss.  0.1 keeps theta_loss at ~10% of total loss magnitude."},
+    )
+    theta_low_alpha: float = field(
+        default=5.0,
+        metadata={"help": "Sigmoid temperature: p_latent = sigmoid(alpha*(theta - entropy)). "
+                          "Higher alpha → sharper decision boundary.  Keep fixed during training."},
+    )
+    theta_search: bool = field(
+        default=False,
+        metadata={"help": "Optimise theta_low by sliding-window SPSA on the reward "
+                          "(ThetaSlidingWindowCallback) instead of the zero-signal REINFORCE "
+                          "theta_loss. Also removes theta_low's autograd param group / grad-sync."},
+    )
+    theta_search_delta: float = field(
+        default=0.3,
+        metadata={"help": "SPSA perturbation size (±) applied to theta_low each step. "
+                          "Larger = better signal-to-noise vs the batch-reward noise "
+                          "(the 1/delta amplification of noise shrinks too)."},
+    )
+    theta_search_lr: float = field(
+        default=0.005,
+        metadata={"help": "SPSA step size for the theta_low update (theta-units, since the "
+                          "advantage is std-normalised). Small so the windowed signal "
+                          "accumulates instead of chasing per-batch noise."},
+    )
+    theta_search_window: int = field(
+        default=80,
+        metadata={"help": "Sliding-window size (steps) for the SPSA reward baseline + gradient. "
+                          "Larger averages out more of the per-prompt reward noise."},
+    )
+    theta_search_min: float = field(
+        default=0.6,
+        metadata={"help": "Lower bound of the theta_low FIRING BAND. theta is clamped here so "
+                          "it cannot collapse to the floor (latents off) — the reward gradient "
+                          "always pulls toward fewer latents, so this band keeps latents firing."},
+    )
+    theta_search_max: float = field(
+        default=1.0,
+        metadata={"help": "Upper bound of the theta_low firing band (prevents over-firing / the "
+                          "accuracy crash seen at theta~1.8)."},
+    )
+    theta_search_max_step: float = field(
+        default=0.02,
+        metadata={"help": "Max |change| to theta_low per update. Hard cap so no single noisy "
+                          "batch can jump theta across the band."},
+    )
+    disable_latents: bool = field(
+        default=False,
+        metadata={"help": "Latent ablation. When True, is_latent_step() always returns False "
+                          "(no <start-latent>/<latent>/<end-latent> blocks are emitted) regardless "
+                          "of theta_low or entropy, and the checkpoint's theta_low.pt is NOT reloaded "
+                          "on resume. Use to measure a with-latent checkpoint's reliance on latent "
+                          "reasoning at inference. Note: theta must be forced OFF here, not high — "
+                          "high theta_low makes latents fire MORE."},
+    )
+    eval_only: bool = field(
+        default=False,
+        metadata={"help": "Zero-training evaluation. Loads the checkpoint (LoRA adapter via "
+                          "trainer._load_from_checkpoint + gate/injector/theta from the manual "
+                          "block), runs trainer.evaluate() once, prints eval metrics, and exits "
+                          "WITHOUT any optimizer steps. Requires --resume_from_checkpoint. Combine "
+                          "with --disable_latents for a pure latent-off inference measurement."},
+    )
+
+
+# ── Learnable LatentSp controller ─────────────────────────────────────────────
+
+class LatentSpControllerOptB(nn.Module):
+    """
+    Drop-in replacement for w9's LatentSpController with learnable theta_low.
+
+    theta_low is an nn.Parameter (1-D scalar) trained via REINFORCE.
+    Effective threshold = clamp(theta_low_param, 0.05, 8.0) * _warmup_scale.
+
+    During generation (inside torch.no_grad()):
+      p_latent = sigmoid(alpha * (eff_theta - entropy))
+      decision ~ Bernoulli(p_latent)
+      decision is stored in _step_decisions for the REINFORCE backward.
+
+    In compute_loss():
+      theta_loss = -adv_mean * mean(log π(decisions))
+    where log π is re-computed WITH gradient flow through theta_low_param.
+
+    DDP note: theta_low_param lives outside the DDP-wrapped model. Each rank
+    updates it from its own completions but using the shared mean advantage.
+    The 1-D parameter stays directionally correct across ranks; exact sync is
+    not needed for the research experiment.
+    """
+
+    def __init__(
+        self,
+        theta_low_init:  float = 1.0,
+        theta_high:      float = 2.5,
+        max_consecutive: int   = 3,
+        alpha:           float = 5.0,
+        disabled:        bool  = False,
+    ):
+        super().__init__()
+        self.theta_low_param  = nn.Parameter(torch.tensor(float(theta_low_init)))
+        self.theta_high       = theta_high
+        self.max_consecutive  = max_consecutive
+        self.alpha            = alpha  # fixed sigmoid temperature
+        self.disabled         = disabled  # latent ablation: hard-off, ignores theta/entropy
+
+        # Set by LatentSpWarmupCallbackOptB at each step.
+        self._warmup_scale: float = 0.0
+
+        # (entropy: float, was_latent: bool) per boundary decision this step.
+        # Cleared by LatentSpWarmupCallbackOptB.on_step_begin.
+        self._step_decisions: List[Tuple[float, bool]] = []
+
+        # Per-COMPLETION decisions for the per-row REINFORCE (correct credit
+        # assignment). None → legacy batch-shared path. When set by
+        # reset_row_decisions(B), it is a length-B list; row i holds that
+        # completion's own (entropy, was_latent) boundary decisions.
+        self._step_decisions_row: Optional[List[List[Tuple[float, bool]]]] = None
+
+        # Sliding-window SPSA search for theta_low (derivative-free, on the reward).
+        # _theta_perturb is added to theta_low_param at generation time this step;
+        # _reward_window holds (sign, reward) observations for the finite-diff update.
+        self._theta_perturb: float = 0.0
+        self._reward_window: List[Tuple[float, float]] = []
+
+    @property
+    def theta_low(self) -> float:
+        """Effective theta_low for display / downstream callers."""
+        if self.disabled:
+            return 0.0  # latent ablation: report 0 so downstream 'theta<=0' guards see latents-off
+        return (max(0.05, min(8.0, self.theta_low_param.item() + self._theta_perturb)) * self._warmup_scale)
+
+    def is_latent_step(self, entropy: float, consecutive: int) -> bool:
+        """
+        Stochastic latent-step decision; records (entropy, decision) for REINFORCE.
+
+        Falls back to deterministic False when _warmup_scale=0 (warmup phase) so
+        generation is well-defined even before the param has been trained at all.
+        """
+        if self.disabled:
+            return False  # latent ablation: never fire a latent step
+        if self._warmup_scale <= 0.0:
+            return False
+
+        eff_theta = (max(0.05, min(8.0, self.theta_low_param.item() + self._theta_perturb)) * self._warmup_scale)
+        with torch.no_grad():
+            p = torch.sigmoid(
+                torch.tensor(self.alpha * (eff_theta - entropy), dtype=torch.float32)
+            ).item()
+        was_latent = (
+            bool(torch.bernoulli(torch.tensor(p)).item())
+            and consecutive < self.max_consecutive
+        )
+        self._step_decisions.append((entropy, was_latent))
+        return was_latent
+
+    def is_dna_inject(self, entropy: float) -> bool:
+        return entropy > self.theta_high
+
+    def clear_decisions(self):
+        self._step_decisions.clear()
+        self._step_decisions_row = None
+
+    # ── Sliding-window SPSA search on theta_low (derivative-free) ──────────────
+    def set_perturbation(self, step: int, delta: float) -> float:
+        """Set an antithetic ±delta perturbation on theta_low for this step, seeded
+        by `step` so it is IDENTICAL on every rank (no RNG-state or collective needed).
+        Returns the sign used, to pair with this step's reward."""
+        import random as _random
+        sign = 1.0 if _random.Random(int(step)).random() < 0.5 else -1.0
+        self._theta_perturb = sign * float(delta)
+        return sign
+
+    def sliding_window_update(self, sign: float, reward: float, lr: float,
+                              delta: float, window: int, warmup_done: bool,
+                              theta_min: float = 0.6, theta_max: float = 1.0,
+                              max_step: float = 0.02):
+        """SPSA update of theta_low_param from a sliding window of (sign, reward),
+        with a windowed baseline (subtract the window-mean reward) for variance
+        reduction — the 'advantage'. Since inputs (gathered reward + step-seeded sign)
+        are identical across ranks, every rank performs the SAME scalar update, so
+        theta_low_param stays in lock-step with NO collective.
+
+        Three stabilisers make it robust to the large batch-reward noise (std ~2.6,
+        from per-prompt correctness variance) that otherwise swamps the ±delta signal
+        and lets theta random-walk across the whole range:
+          1. std-normalised advantage — divide by the window reward std so the update
+             is invariant to reward scale (lr is then in theta-units, not reward-units);
+          2. per-step clip to ±max_step — no single noisy batch can jump theta far;
+          3. clamp to [theta_min, theta_max] — a LATENT-FIRING band, so theta can
+             neither collapse to the floor (latents off) nor blow up (over-firing).
+        The reward gradient w.r.t. theta points toward fewer latents (correctness
+        dominates), so the band is what keeps latents firing; the search only refines
+        within it (the eval sweep found 0.5–0.8 all ~0.95, so the band is safe)."""
+        self._reward_window.append((float(sign), float(reward)))
+        if len(self._reward_window) > window:
+            self._reward_window.pop(0)
+        if not warmup_done or len(self._reward_window) < window:
+            return
+        rs   = [r for _, r in self._reward_window]
+        base = sum(rs) / len(rs)                                  # windowed baseline
+        var  = sum((r - base) ** 2 for r in rs) / len(rs)
+        std  = max(var ** 0.5, 1e-6)                              # reward-scale normaliser
+        g    = (sum(s * (r - base) for s, r in self._reward_window)
+                / len(self._reward_window) / std / max(float(delta), 1e-6))
+        step = float(lr) * g
+        step = max(-float(max_step), min(float(max_step), step))  # bound the per-step move
+        with torch.no_grad():
+            self.theta_low_param.add_(step)
+            self.theta_low_param.clamp_(float(theta_min), float(theta_max))
+
+    def reset_row_decisions(self, batch_size: int):
+        """Begin per-completion decision tracking for a batch of `batch_size` rollouts
+        (enables the per-row REINFORCE credit assignment in compute_theta_loss)."""
+        self._step_decisions_row = [[] for _ in range(batch_size)]
+
+    def is_latent_step_row(self, entropy: float, consecutive: int, row: int) -> bool:
+        """Per-COMPLETION latent decision (one row). Same stochastic rule as
+        is_latent_step, but the (entropy, was_latent) is credited to completion `row`
+        so the REINFORCE can correlate a completion's own advantage with its own
+        latent choices."""
+        if self.disabled or self._warmup_scale <= 0.0:
+            return False
+        eff_theta = (max(0.05, min(8.0, self.theta_low_param.item() + self._theta_perturb)) * self._warmup_scale)
+        with torch.no_grad():
+            p = torch.sigmoid(
+                torch.tensor(self.alpha * (eff_theta - entropy), dtype=torch.float32)
+            ).item()
+        was_latent = (bool(torch.bernoulli(torch.tensor(p)).item())
+                      and consecutive < self.max_consecutive)
+        if self._step_decisions_row is not None and 0 <= row < len(self._step_decisions_row):
+            self._step_decisions_row[row].append((entropy, was_latent))
+        return was_latent
+
+    def compute_theta_loss(self, advantages) -> Optional[torch.Tensor]:
+        """REINFORCE loss for theta_low.
+
+        PER-COMPLETION path (after reset_row_decisions()) — correct credit assignment:
+            L = -(1/N) Σ_i A_i · Σ_{(h,d) ∈ completion i} log π(d | h)
+        Each completion's OWN advantage A_i weights ITS OWN latent decisions. The signal
+        is non-zero and correctly credited — unlike the group-MEAN advantage, which is
+        ~0 by GRPO normalisation (rewards − group_mean), which is why the legacy
+        estimator barely learned.
+
+        LEGACY path (batch-shared self._step_decisions): the old
+        -adv_mean · mean(log π), kept for the shared-decision generation path.
+        `advantages` may be the per-completion tensor or a scalar mean.
+
+        log(sigmoid(x)) = -softplus(-x) for numerical stability.
+        """
+        if self._warmup_scale <= 0.0:
+            return None
+        dtype  = self.theta_low_param.dtype
+        device = self.theta_low_param.device
+        eff_theta = self.theta_low_param.clamp(0.05, 8.0) * self._warmup_scale
+
+        # ── Per-completion credit assignment ──────────────────────────────────
+        if self._step_decisions_row is not None:
+            adv = (advantages.detach().to(device).float() if torch.is_tensor(advantages)
+                   else torch.tensor([float(advantages)], device=device))
+            terms = []
+            for i, decs in enumerate(self._step_decisions_row):
+                if not decs or i >= adv.numel():
+                    continue
+                h  = torch.tensor([e for e, _ in decs], dtype=dtype, device=device)
+                d  = torch.tensor([b for _, b in decs], dtype=torch.bool, device=device)
+                lg = self.alpha * (eff_theta - h)
+                lp = torch.where(d, -F.softplus(-lg), -F.softplus(lg))
+                terms.append(adv[i] * lp.sum())
+            if not terms:
+                return None
+            return -torch.stack(terms).mean()
+
+        # ── Legacy batch-shared path ──────────────────────────────────────────
+        if not self._step_decisions:
+            return None
+        adv_mean = (advantages.float().mean().item() if torch.is_tensor(advantages)
+                    else float(advantages))
+        entropies  = torch.tensor([h for h, _ in self._step_decisions], dtype=dtype, device=device)
+        was_latent = torch.tensor([d for _, d in self._step_decisions], dtype=torch.bool, device=device)
+        logits     = self.alpha * (eff_theta - entropies)
+        log_pi     = torch.where(was_latent, -F.softplus(-logits), -F.softplus(logits))
+        return -float(adv_mean) * log_pi.mean()
+
+
+# ── Warmup callback (sets _warmup_scale, clears buffer) ───────────────────────
+
+class LatentSpWarmupCallbackOptB(TrainerCallback):
+    """
+    Ramps latentSp_ctrl._warmup_scale from 0 → 1 and clears the REINFORCE
+    decision buffer at the start of each training step.
+
+    Unlike w9's LatentSpWarmupCallback (which wrote theta_low directly),
+    this one never touches theta_low_param — the optimizer owns that.
+    Setting _warmup_scale to 0 during warmup simply gates is_latent_step
+    to return False without corrupting the learned parameter value.
+    """
+
+    def __init__(
+        self,
+        ctrl:         LatentSpControllerOptB,
+        warmup_steps: int,
+        ramp_steps:   int,
+    ):
+        self._ctrl        = ctrl
+        self.warmup_steps = warmup_steps
+        self.ramp_steps   = ramp_steps
+        self._prev_phase  = None
+
+    def _rank0_print(self, msg: str):
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        if rank == 0:
+            print(msg, flush=True)
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        step = state.global_step
+
+        # Always clear buffer so each step starts fresh
+        self._ctrl.clear_decisions()
+
+        if step < self.warmup_steps:
+            scale, phase = 0.0, "warmup"
+        elif step < self.warmup_steps + self.ramp_steps:
+            frac         = (step - self.warmup_steps) / max(self.ramp_steps, 1)
+            scale, phase = frac, "ramp"
+        else:
+            scale, phase = 1.0, "active"
+
+        self._ctrl._warmup_scale = scale
+
+        if phase != self._prev_phase:
+            msgs = {
+                "warmup": (
+                    f"\n[LatentSpOptB] ── WARMUP  (step {step})\n"
+                    f"[LatentSpOptB]    scale=0 for {self.warmup_steps} steps "
+                    f"— is_latent_step=False, theta_low_param free to warm up.\n"
+                ),
+                "ramp": (
+                    f"\n[LatentSpOptB] ── RAMP  (step {step})\n"
+                    f"[LatentSpOptB]    scale 0→1 over {self.ramp_steps} steps "
+                    f"— stochastic latent steps and REINFORCE active.\n"
+                ),
+                "active": (
+                    f"\n[LatentSpOptB] ── ACTIVE  (step {step})\n"
+                    f"[LatentSpOptB]    scale=1.0  "
+                    f"theta_low_param={self._ctrl.theta_low_param.item():.4f}\n"
+                ),
+            }
+            self._rank0_print(msgs[phase])
+            self._prev_phase = phase
+
+        if step % args.logging_steps == 0 and scale > 0:
+            self._rank0_print(
+                f"[LatentSpOptB] scale={scale:.4f}  "
+                f"theta_low_param={self._ctrl.theta_low_param.item():.4f}  "
+                f"eff_theta={self._ctrl.theta_low:.4f}  step={step}"
+            )
+
+
+# ── Sliding-window SPSA search on theta_low ───────────────────────────────────
+
+class ThetaSlidingWindowCallback(TrainerCallback):
+    """Derivative-free search for theta_low on the actual reward (replaces the
+    zero-signal REINFORCE). on_step_begin perturbs theta by +/-delta (seeded by the
+    step, identical on every rank); on_step_end reads the GATHERED mean reward for
+    this step and does the windowed SPSA update. All ranks see the same reward and
+    sign -> identical scalar update -> theta stays in sync with NO collective.
+
+    Generation happens once per global_step (num_iterations=1), so the reward logged
+    at _metrics['train']['reward'][-1] at on_step_end corresponds to this step's
+    perturbed-theta rollouts.
+    """
+
+    def __init__(self, ctrl: "LatentSpControllerOptB", warmup_steps: int,
+                 delta: float, lr: float, window: int,
+                 theta_min: float = 0.6, theta_max: float = 1.0,
+                 max_step: float = 0.02):
+        self._ctrl     = ctrl
+        self.warmup    = warmup_steps
+        self.delta     = float(delta)
+        self.lr        = float(lr)
+        self.window    = int(window)
+        self.theta_min = float(theta_min)
+        self.theta_max = float(theta_max)
+        self.max_step  = float(max_step)
+        self.trainer   = None       # set after trainer construction in main()
+        self._sign     = 1.0
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        self._sign = self._ctrl.set_perturbation(state.global_step, self.delta)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        m = getattr(self.trainer, "_metrics", None) if self.trainer is not None else None
+        hist = (m.get("train", {}) or {}).get("reward", []) if m else []
+        if not hist:
+            return
+        warmup_done = state.global_step >= self.warmup
+        self._ctrl.sliding_window_update(
+            self._sign, hist[-1], self.lr, self.delta, self.window, warmup_done,
+            theta_min=self.theta_min, theta_max=self.theta_max, max_step=self.max_step,
+        )
+
+
+# ── Save callback (gate + injector + theta_low_param) ─────────────────────────
+
+class SaveGateInjectorThetaCallback(TrainerCallback):
+    """Save thinking_gate.pt, dna_injector.pt, and theta_low.pt at every checkpoint."""
+
+    def __init__(
+        self,
+        thinking_gate:  ThinkingResidualGate,
+        dna_injector:   DNAHiddenInjector,
+        latentSp_ctrl:  LatentSpControllerOptB,
+    ):
+        self.thinking_gate = thinking_gate
+        self.dna_injector  = dna_injector
+        self.latentSp_ctrl = latentSp_ctrl
+
+    def on_save(self, args, state, control, **kwargs):
+        folder = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        os.makedirs(folder, exist_ok=True)
+        torch.save(self.thinking_gate.state_dict(),
+                   os.path.join(folder, "thinking_gate.pt"))
+        torch.save(self.dna_injector.state_dict(),
+                   os.path.join(folder, "dna_injector.pt"))
+        torch.save({"theta_low_param": self.latentSp_ctrl.theta_low_param.data},
+                   os.path.join(folder, "theta_low.pt"))
+        print(
+            f"[OptB] thinking_gate + dna_injector + theta_low "
+            f"→ {folder}/  (theta_low={self.latentSp_ctrl.theta_low_param.item():.4f})"
+        )
+
+
+# ── Tie-breaking: prefer latest checkpoint when metric is equal ───────────────
+
+class PreferLatestOnTieCallback(TrainerCallback):
+    """When eval metric equals the current best, update best_model_checkpoint to
+    point at the latest checkpoint *before* _save_checkpoint runs rotation, so
+    save_total_limit protects the most recent tied checkpoint instead of the
+    older one. Fires inside on_evaluate, ahead of _determine_best_metric and
+    _save_checkpoint — the folder need not exist yet (it's just a path string)."""
+
+    def __init__(self, metric_name: str, greater_is_better: bool = True):
+        self.metric_name      = metric_name
+        self.greater_is_better = greater_is_better
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics is None or state.best_metric is None:
+            return
+        key = f"eval_{self.metric_name}"
+        current = metrics.get(key)
+        if current is None:
+            return
+        if current == state.best_metric:
+            latest = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+            state.best_model_checkpoint = latest
+            try:
+                import torch.distributed as dist
+                rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            except Exception:
+                rank = 0
+            if rank == 0:
+                print(
+                    f"[PreferLatest] Tie at {self.metric_name}={current:.4f} "
+                    f"→ best_model_checkpoint updated to checkpoint-{state.global_step}"
+                )
+
+
+# ── Keep only the top-N checkpoints by eval metric ────────────────────────────
+
+class KeepBestNCheckpointsCallback(TrainerCallback):
+    """Retain every checkpoint whose eval score falls in the top-N DISTINCT score
+    tiers (`metric_for_best_model` = `correctness`, which the evaluate() override
+    computes as val accuracy — fraction correct in [0,1], on a fixed 50-record
+    slice with greedy decoding); delete the rest after each save. Rank 0 only.
+
+    N counts distinct score VALUES, not checkpoints: with N=2 and scores
+    {0.90,0.90,0.90,0.86} the two top tiers are {0.90, 0.86}, so ALL four survive.
+    A checkpoint is dropped only once N strictly better score tiers exist above it.
+    (The 50-record eval has 2% granularity, so many checkpoints share a score.)
+
+    HF's own save_total_limit rotates by *recency* (keeping best-1 + most-recent),
+    which would delete a high-accuracy *old* checkpoint. This callback keeps by
+    score tier instead.
+
+    Safety: never deletes the current-step checkpoint or best_model_checkpoint, and
+    never touches a checkpoint it has no eval score for (e.g. ones inherited from a
+    resumed run), so it can't nuke foreign/unscored folders. Requires HF rotation
+    to be disabled (do NOT pass --save_total_limit) so it owns pruning exclusively.
+    """
+
+    def __init__(self, metric_name: str, n: int = 3, greater_is_better: bool = True):
+        self.key     = f"eval_{metric_name}"
+        self.n       = max(1, int(n))
+        self.greater = greater_is_better
+        self.scores  = {}   # global_step -> eval metric value
+
+    @staticmethod
+    def _is_rank0() -> bool:
+        try:
+            import torch.distributed as dist
+            return (not dist.is_initialized()) or dist.get_rank() == 0
+        except Exception:
+            return True
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics and metrics.get(self.key) is not None:
+            self.scores[state.global_step] = float(metrics[self.key])
+
+    def on_save(self, args, state, control, **kwargs):
+        if not self._is_rank0():
+            return
+        import re, shutil
+        existing = {}
+        for d in os.listdir(args.output_dir):
+            m = re.fullmatch(r"checkpoint-(\d+)", d)
+            p = os.path.join(args.output_dir, d)
+            if m and os.path.isdir(p):
+                existing[int(m.group(1))] = p
+
+        # Keep every checkpoint whose score is in the top-N DISTINCT score tiers.
+        # N counts distinct accuracy VALUES, not checkpoints — so all checkpoints
+        # sharing a kept tier survive, and a lower tier is retained until N strictly
+        # better tiers exist above it. E.g. N=2, scores {0.90,0.90,0.90,0.86} -> keep
+        # tiers {0.90, 0.86} -> all four kept.
+        _r = lambda v: round(v, 6)                        # guard float jitter
+        scored = sorted(
+            ((s, self.scores[s]) for s in existing if s in self.scores),
+            key=lambda x: (x[1] if self.greater else -x[1], x[0]),
+            reverse=True,                                 # for a stable print order
+        )
+        top_tiers = set(
+            sorted({_r(v) for _, v in scored}, reverse=self.greater)[: self.n]
+        )
+        keep = {s for s, v in scored if _r(v) in top_tiers}
+        keep.add(state.global_step)                       # never drop the latest
+        if state.best_model_checkpoint:                   # never drop HF's best
+            m = re.search(r"checkpoint-(\d+)", state.best_model_checkpoint)
+            if m:
+                keep.add(int(m.group(1)))
+
+        for s, score in scored:
+            if s in keep:
+                continue
+            shutil.rmtree(existing[s], ignore_errors=True)
+            print(f"[KeepBestN] Removed checkpoint-{s} ({self.key}={score:.4f}) "
+                  f"— keeping top-{self.n} score tiers", flush=True)
+
+        kept = sorted(s for s in existing if s in keep or s not in self.scores)
+        print(f"[KeepBestN] Kept checkpoints (top-{self.n} {self.key} tiers): {kept}",
+              flush=True)
+
+
+# ── Trainer with REINFORCE theta_loss ─────────────────────────────────────────
+
+class ThinkingResidualGRPOTrainer_OptB(ThinkingResidualGRPOTrainer):
+    """
+    Extends ThinkingResidualGRPOTrainer with:
+      1. theta_low_param as an extra AdamW param group (create_optimizer override)
+      2. REINFORCE theta_loss added to the total loss (compute_loss override)
+    """
+
+    def __init__(
+        self,
+        latentSp_ctrl:    LatentSpControllerOptB,
+        theta_low_lr:     float = 1e-4,
+        theta_low_weight: float = 0.1,
+        theta_search:     bool  = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.latentSp_ctrl    = latentSp_ctrl
+        self.theta_low_lr     = theta_low_lr
+        self.theta_low_weight = theta_low_weight
+        # theta_search: optimise theta_low by sliding-window SPSA on the reward
+        # (ThetaSlidingWindowCallback) instead of the zero-signal REINFORCE. When on,
+        # theta_low_param is NOT an autograd param (no optimizer group, no grad sync).
+        self.theta_search     = theta_search
+
+        # theta_low_param lives outside the DDP-wrapped model, so DDP does not
+        # sync its gradient — we must do it ourselves. The previous approach (an
+        # autograd hook on the param) only fired on steps where theta_loss was
+        # computed, i.e. where latents fired. On a step where one rank fired
+        # latents and another did not (e.g. a degenerate / no-latent batch), the
+        # hook ran the all_reduce on ONLY one rank -> NCCL collective desync ->
+        # deadlock. We now sync explicitly and UNCONDITIONALLY in training_step()
+        # so every rank always issues the same collective. See _sync_theta_low_grad.
+
+    def training_step(self, *args, **kwargs):
+        loss = super().training_step(*args, **kwargs)
+        # Sync only at the accumulation boundary (when the optimizer will step),
+        # but ALWAYS on every rank there — regardless of whether this rank fired
+        # any latents — so the collective count can never diverge across ranks.
+        # Skipped in theta_search mode: theta_low_param has no gradient (updated by
+        # the sliding-window callback), so there is nothing to sync.
+        if self.accelerator.sync_gradients and not self.theta_search:
+            self._sync_theta_low_grad()
+        return loss
+
+    def _sync_theta_low_grad(self):
+        """Average theta_low_param.grad across ranks, unconditionally.
+
+        Runs on every rank at every optimizer step, even when this rank fired no
+        latents (it then contributes a zero grad), so the all_reduce count never
+        diverges and NCCL can't deadlock. The average is count-weighted — taken
+        over only the ranks that actually produced a grad — so the REINFORCE
+        update magnitude is preserved and theta_low_param stays in lock-step.
+        """
+        import torch.distributed as dist
+        if not (dist.is_available() and dist.is_initialized()
+                and dist.get_world_size() > 1):
+            return
+        param    = self.latentSp_ctrl.theta_low_param
+        had_grad = param.grad is not None
+        grad     = param.grad if had_grad else torch.zeros_like(param)
+        # Both collectives fire on every rank -> no desync.
+        dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+        count = torch.tensor(1.0 if had_grad else 0.0, device=grad.device)
+        dist.all_reduce(count, op=dist.ReduceOp.SUM)
+        n = count.item()
+        if n > 0:
+            grad.div_(n)          # mean over the ranks that actually fired
+            param.grad = grad     # no-op reassignment when it was already param.grad
+        # n == 0: no rank fired this step; leave param.grad as-is (None on all ranks)
+
+    def create_optimizer(self):
+        """Add theta_low_param as a separate AdamW param group."""
+        base_lr = self.args.learning_rate
+        param_groups = make_thinking_residual_param_groups(
+            model                = self.model,
+            thinking_gate        = self.thinking_gate,
+            base_lr              = base_lr,
+            lr_multiplier_gate   = 20.0,
+            lr_multiplier_lambda = 20.0,
+            weight_decay         = self.args.weight_decay,
+        )
+        # In theta_search mode theta_low_param is updated by SPSA, not AdamW — so
+        # do NOT add it as an optimizer param group (keeps it out of autograd/sync).
+        if not self.theta_search:
+            param_groups.append({
+                "params":       [self.latentSp_ctrl.theta_low_param],
+                "lr":           self.theta_low_lr,
+                "weight_decay": 0.0,
+            })
+        self.optimizer = torch.optim.AdamW(param_groups)
+        print(
+            f"[OptB] Optimizer: {len(param_groups)} param groups | "
+            f"base_lr={base_lr:.2e}  "
+            f"gate_lr={base_lr*20:.2e}  "
+            f"theta_low_lr={self.theta_low_lr:.2e}"
+        )
+        return self.optimizer
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Standard GRPO + manifold loss from parent
+        loss = super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+
+        if loss.item() == 0.0:
+            return loss  # anomaly guard zeroed the loss — skip theta_loss too
+
+        # theta_search: the sliding-window SPSA callback owns theta_low — just log it
+        # and skip the REINFORCE entirely.
+        if self.theta_search:
+            if self.latentSp_ctrl._warmup_scale > 0.0:
+                mode = "train" if model.training else "eval"
+                self._metrics[mode].setdefault("theta_low_param", []).append(
+                    self.latentSp_ctrl.theta_low_param.detach().item())
+                self._metrics[mode].setdefault("theta_low_eff", []).append(
+                    self.latentSp_ctrl.theta_low)
+            return loss
+
+        # REINFORCE: theta_loss uses decisions recorded during generate_with_hrpo_gate
+        decisions = self.latentSp_ctrl._step_decisions
+        if decisions and self.latentSp_ctrl._warmup_scale > 0.0:
+            adv = inputs.get("advantages", None)
+            if adv is not None:
+                # Pass the per-completion advantage VECTOR (not the ~0 group mean).
+                # compute_theta_loss uses per-completion credit when the generation
+                # recorded per-row decisions; otherwise it means internally (legacy).
+                theta_loss = self.latentSp_ctrl.compute_theta_loss(adv)
+                if theta_loss is not None and torch.isfinite(theta_loss).item():
+                    # theta_loss is on the same device as theta_low_param
+                    # (now CUDA after the .to() in main); broadcast to loss
+                    # device just in case.
+                    loss = loss + self.theta_low_weight * theta_loss.to(loss.device)
+                    mode = "train" if model.training else "eval"
+                    # Log the LOCAL value — NO gather. gather_for_metrics is a
+                    # collective, and this line sits inside the data-dependent
+                    # `if decisions ...` branch, so it fires only on ranks that
+                    # had latent decisions. When one rank collapses to a
+                    # no-latent / anomalous batch it skips this while others run
+                    # it -> NCCL stream desync -> deadlock (seen at step ~1805).
+                    # Metrics don't need a cross-rank gather.
+                    self._metrics[mode].setdefault("theta_low_loss", []).append(
+                        theta_loss.detach().item()
+                    )
+                    self._metrics[mode].setdefault("theta_low_param", []).append(
+                        self.latentSp_ctrl.theta_low_param.detach().item()
+                    )
+                    self._metrics[mode].setdefault("theta_low_eff", []).append(
+                        self.latentSp_ctrl.theta_low
+                    )
+                    self._metrics[mode].setdefault("n_latent_decisions", []).append(
+                        float(sum(1 for _, d in decisions if d))
+                    )
+
+        return loss
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main(script_args, training_args, model_args):
+    torch.cuda.empty_cache()
+    torch.set_float32_matmul_precision("medium")
+
+    manifold_gate = ManifoldGateW6(stage2_dir=getattr(script_args, "stage2_dir", None))
+
+    model = DNALLMModel(
+        text_model_name      = model_args.text_model_name,
+        dna_model_name       = model_args.dna_model_name,
+        cache_dir            = model_args.cache_dir,
+        max_length_text      = model_args.max_length_text,
+        max_length_dna       = model_args.max_length_dna,
+        text_model_finetune  = True,
+        dna_model_finetune   = model_args.dna_model_finetune,
+        dna_is_evo2          = model_args.dna_is_evo2,
+        dna_embedding_layer  = model_args.dna_embedding_layer,
+        use_cross_attention  = model_args.use_cross_attention,
+        use_hrpo_gate        = True,
+        use_dna_gate         = False,
+        device               = "cuda",
+    ).to("cuda")
+    model.text_model.config.use_cache = False
+
+    hidden_size = model.text_hidden_size
+
+    thinking_gate = ThinkingResidualGate(
+        hidden_size = hidden_size,
+        use_ot_dist = manifold_gate.mode != "onthefly",
+        r_min       = 0.5,
+        r_max       = 0.99,
+    ).to("cuda")
+
+    dna_injector = DNAHiddenInjector(
+        hidden_size = hidden_size,
+        r_min       = 0.7,
+        r_max       = 0.99,
+    ).to("cuda")
+
+    # ── LatentSpControllerOptB (learnable theta_low) ──────────────────────────
+    _use_warmup = (
+        script_args.latentSp_warmup_steps > 0 or script_args.latentSp_ramp_steps > 0
+    )
+    latentSp_ctrl = LatentSpControllerOptB(
+        theta_low_init  = script_args.latentSp_theta_low,
+        theta_high      = script_args.latentSp_theta_high,
+        max_consecutive = script_args.latentSp_max_consec,
+        alpha           = script_args.theta_low_alpha,
+        disabled        = script_args.disable_latents,
+    ).to("cuda")  # theta_low_param must live on the same device as the GRPO loss
+    if script_args.disable_latents:
+        print("[OptB] --disable_latents: latent steps HARD-OFF (ablation); theta_low.pt will not be reloaded.")
+    # Scale starts at 0 when warmup is requested (same effective behaviour as w9)
+    if _use_warmup:
+        latentSp_ctrl._warmup_scale = 0.0
+        print(
+            f"[OptB] theta_low_param={latentSp_ctrl.theta_low_param.item():.3f}  "
+            f"warmup={script_args.latentSp_warmup_steps} ramp={script_args.latentSp_ramp_steps} steps"
+        )
+    else:
+        latentSp_ctrl._warmup_scale = 1.0
+
+    print(
+        f"[OptB] ThinkingResidualGate: hidden={hidden_size}  "
+        f"params={sum(p.numel() for p in thinking_gate.parameters()):,}"
+    )
+    print(
+        f"[OptB] DNAHiddenInjector:    hidden={hidden_size}  "
+        f"params={sum(p.numel() for p in dna_injector.parameters()):,}"
+    )
+    print(
+        f"[OptB] theta_low_param init={script_args.latentSp_theta_low}  "
+        f"alpha={script_args.theta_low_alpha}  "
+        f"theta_low_lr={script_args.theta_low_lr}  "
+        f"theta_low_weight={script_args.theta_low_weight}"
+    )
+
+    # ── Load gate/injector checkpoints ────────────────────────────────────────
+    gate_ckpt_path = getattr(script_args, "gate_ckpt", None)
+    inj_ckpt_path  = getattr(script_args, "injector_ckpt", None)
+    if gate_ckpt_path and os.path.exists(gate_ckpt_path):
+        _m, _u = thinking_gate.load_state_dict(
+            torch.load(gate_ckpt_path, map_location="cpu"), strict=False
+        )
+        if _m:
+            print(f"[OptB] thinking_gate missing keys (fresh init): {_m}")
+        if _u:
+            print(f"[OptB] thinking_gate unexpected keys (ignored): {_u}")
+        print(f"[OptB] Loaded thinking_gate ← {gate_ckpt_path}")
+    elif gate_ckpt_path:
+        print(f"[OptB] WARNING: gate_ckpt not found: {gate_ckpt_path} — fresh init")
+    if inj_ckpt_path and os.path.exists(inj_ckpt_path):
+        dna_injector.load_state_dict(
+            torch.load(inj_ckpt_path, map_location="cpu"), strict=False
+        )
+        print(f"[OptB] Loaded dna_injector  ← {inj_ckpt_path}")
+    elif inj_ckpt_path:
+        print(f"[OptB] WARNING: injector_ckpt not found: {inj_ckpt_path} — fresh init")
+
+    # ── Vocab / latent token setup ────────────────────────────────────────────
+    tokenizer = model.processor.tokenizer
+    _all_latent = [_LATENT_START_TOKEN, _LATENT_END_TOKEN, _LATENT_PAD_TOKEN]
+    _missing = [t for t in _all_latent
+                if tokenizer.convert_tokens_to_ids(t) == tokenizer.unk_token_id]
+    if _missing:
+        tokenizer.add_special_tokens({"additional_special_tokens": _missing})
+        model.text_model.resize_token_embeddings(len(tokenizer))
+        print(f"[OptB] Pre-load: added {_missing} → vocab={len(tokenizer)}")
+    else:
+        print(f"[OptB] Pre-load: latent tokens already in vocab (size={len(tokenizer)})")
+
+    _load_sft_checkpoint(model, model_args, merge_lora=True)
+    _prep_for_training(model, model_args)
+
+    if hasattr(model, "gate_net") and model.gate_net is not None:
+        model.gate_net.requires_grad_(False)
+
+    latent_start_id = tokenizer.convert_tokens_to_ids(_LATENT_START_TOKEN)
+    latent_end_id   = tokenizer.convert_tokens_to_ids(_LATENT_END_TOKEN)
+    print(f"[OptB] Latent tokens: {_LATENT_START_TOKEN}={latent_start_id}  "
+          f"{_LATENT_END_TOKEN}={latent_end_id}")
+
+    # Patch model: generation loop, forward, gate loss — all from w9 (duck-typed)
+    patch_model_for_dual_mode_w9(
+        model, thinking_gate, dna_injector, latentSp_ctrl,
+        latent_start_id, latent_end_id,
+        max_new_tokens = script_args.max_think_tokens + 200,
+        lookahead_k    = script_args.latent_lookahead_k,
+    )
+    model._grpo_force_full_trajectory = False
+
+    # Gate factor init
+    _gate_ckpt_loaded = gate_ckpt_path and os.path.isfile(str(gate_ckpt_path))
+    if script_args.gate_warmup_steps == 0 and script_args.gate_ramp_steps == 0:
+        model._gate_warmup_factor     = MAX_GATE_FACTOR
+        model._gate_warmup_min_factor = MAX_GATE_FACTOR
+        print(f"[OptB] gate active from step 0 (factor={MAX_GATE_FACTOR})")
+    elif _gate_ckpt_loaded:
+        model._gate_warmup_factor     = MAX_GATE_FACTOR
+        model._gate_warmup_min_factor = MAX_GATE_FACTOR * 0.5
+    else:
+        model._gate_warmup_factor     = 0.0
+        model._gate_warmup_min_factor = 0.0
+    model._max_gate_factor = MAX_GATE_FACTOR
+    model = model.to(training_args.device)
+
+    if getattr(model_args, "dna_cache", None):
+        _apply_dna_cache(model, model_args.dna_cache)
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"[OptB] Trainable (model):        {trainable:,} / {total:,}")
+    print(f"[OptB] Trainable (gate):         "
+          f"{sum(p.numel() for p in thinking_gate.parameters()):,}")
+    print(f"[OptB] Trainable (injector):     "
+          f"{sum(p.numel() for p in dna_injector.parameters()):,}")
+    print(f"[OptB] Trainable (theta_low):    1  (nn.Parameter)")
+
+    data = get_kegg_dataset(
+        kegg_csv              = script_args.kegg_csv,
+        dataset_name          = getattr(script_args, "dataset_name", None),
+        truncate_dna_per_side = model_args.truncate_dna_per_side,
+    )
+
+    _registry = {
+        **reward_funcs_registry,
+        "ot_distance":  make_ot_reward_func(model, manifold_gate),
+        "latent_usage": make_latent_usage_reward_func(
+            latentSp_ctrl, latent_start_id, latent_end_id,
+        ),
+    }
+    reward_funcs = [_registry[f] for f in script_args.reward_funcs]
+    print(f"[OptB] Reward functions: {script_args.reward_funcs}")
+
+    # Eval-monitor dataset: val + test (290) so eval_correctness tracks the full
+    # held-out number instead of a val-only slice. Falls back to val if there is
+    # no test split. NOTE: with KeepBestN this means the test split influences
+    # checkpoint selection (mild leakage) — see train script comment.
+    if training_args.eval_strategy != "no":
+        from datasets import concatenate_datasets
+        if "test" in data:
+            _eval_ds = concatenate_datasets([data["val"], data["test"]])
+            print(f"[OptB] Eval monitor: val+test = {len(_eval_ds)} records")
+        else:
+            _eval_ds = data["val"]
+            print(f"[OptB] Eval monitor: val = {len(_eval_ds)} records (no test split)")
+    else:
+        _eval_ds = None
+
+    _theta_cb = None
+    if script_args.theta_search:
+        _theta_cb = ThetaSlidingWindowCallback(
+            latentSp_ctrl,
+            warmup_steps = script_args.latentSp_warmup_steps + script_args.latentSp_ramp_steps,
+            delta        = script_args.theta_search_delta,
+            lr           = script_args.theta_search_lr,
+            window       = script_args.theta_search_window,
+            theta_min    = script_args.theta_search_min,
+            theta_max    = script_args.theta_search_max,
+            max_step     = script_args.theta_search_max_step,
+        )
+        print(f"[OptB] theta_search ON: SPSA delta={script_args.theta_search_delta} "
+              f"lr={script_args.theta_search_lr} window={script_args.theta_search_window} "
+              f"band=[{script_args.theta_search_min},{script_args.theta_search_max}] "
+              f"max_step={script_args.theta_search_max_step} "
+              f"(REINFORCE theta_loss + theta grad-sync disabled)")
+
+    trainer = ThinkingResidualGRPOTrainer_OptB(
+        # OptB-specific
+        latentSp_ctrl    = latentSp_ctrl,
+        theta_low_lr     = script_args.theta_low_lr,
+        theta_low_weight = script_args.theta_low_weight,
+        theta_search     = script_args.theta_search,
+        # Base trainer args (from ThinkingResidualGRPOTrainer)
+        thinking_gate    = thinking_gate,
+        manifold_gate    = manifold_gate,
+        manifold_weight  = getattr(script_args, "manifold_weight", 0.0),
+        max_eval_samples = getattr(script_args, "max_eval_samples", None),
+        # Standard GRPOTrainer args
+        model            = model,
+        reward_funcs     = reward_funcs,
+        args             = training_args,
+        dna_module       = NucleotideDNAModule(),
+        train_dataset    = data["train"],
+        eval_dataset     = _eval_ds,
+        peft_config      = None,
+        callbacks        = [
+            SaveWithPyTorchCallback(),
+            SaveGateInjectorThetaCallback(thinking_gate, dna_injector, latentSp_ctrl),
+            GateWarmupCallback(
+                model,
+                warmup_steps = script_args.gate_warmup_steps,
+                ramp_steps   = script_args.gate_ramp_steps,
+            ),
+            LatentSpWarmupCallbackOptB(
+                latentSp_ctrl,
+                warmup_steps = script_args.latentSp_warmup_steps,
+                ramp_steps   = script_args.latentSp_ramp_steps,
+            ),
+            PreferLatestOnTieCallback(
+                metric_name      = training_args.metric_for_best_model,
+                greater_is_better = training_args.greater_is_better,
+            ),
+            KeepBestNCheckpointsCallback(
+                metric_name      = training_args.metric_for_best_model,
+                n                = getattr(script_args, "keep_best_n", 2),
+                greater_is_better = training_args.greater_is_better,
+            ),
+            *([_theta_cb] if _theta_cb is not None else []),
+        ],
+        processing_class = model.processor,
+    )
+    training_args.save_safetensors = False
+    if _theta_cb is not None:
+        _theta_cb.trainer = trainer   # so on_step_end can read the gathered mean reward
+
+    # ── Resume ────────────────────────────────────────────────────────────────
+    resume = training_args.resume_from_checkpoint
+    if resume in ("True", "true"):
+        checkpoints = list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
+        resume = str(max(checkpoints, key=os.path.getmtime)) if checkpoints else None
+        print(f"[OptB] Auto-resume: {resume}")
+
+    if resume and isinstance(resume, str):
+        for fname, obj, key in [
+            ("thinking_gate.pt",  thinking_gate,  None),
+            ("dna_injector.pt",   dna_injector,   None),
+        ]:
+            pt = os.path.join(resume, fname)
+            if os.path.exists(pt):
+                obj.load_state_dict(torch.load(pt, map_location="cpu"))
+                print(f"[OptB] Loaded {fname} ← {pt}")
+        theta_pt = os.path.join(resume, "theta_low.pt")
+        if script_args.disable_latents:
+            print("[OptB] --disable_latents: skipping theta_low.pt reload (latents stay hard-off).")
+        elif os.path.exists(theta_pt):
+            saved = torch.load(theta_pt, map_location="cpu")
+            with torch.no_grad():
+                latentSp_ctrl.theta_low_param.copy_(
+                    saved["theta_low_param"].to(latentSp_ctrl.theta_low_param.device)
+                )
+            print(f"[OptB] Loaded theta_low_param={latentSp_ctrl.theta_low_param.item():.4f} ← {theta_pt}")
+        else:
+            print(f"[OptB] No theta_low.pt in {resume} — keeping init value")
+
+    # ── Eval-only (zero training) ─────────────────────────────────────────────
+    if script_args.eval_only:
+        if not (resume and isinstance(resume, str)):
+            raise ValueError("--eval_only requires --resume_from_checkpoint <checkpoint-N>")
+        if training_args.eval_strategy == "no" or data.get("val") is None:
+            raise ValueError("--eval_only needs an eval dataset: set --eval_strategy steps "
+                             "(and --max_eval_samples) so a val split is built.")
+        # Load the GRPO-trained LoRA adapter / model weights (gate/injector/theta
+        # were already restored by the manual block above). This is what
+        # trainer.train(resume_from_checkpoint=...) does internally before step 0.
+        trainer._load_from_checkpoint(resume)
+        print(f"[OptB] eval_only: loaded model weights ← {resume}; running trainer.evaluate() ...")
+        metrics = trainer.evaluate()
+        print(f"[OptB] eval_only metrics: {metrics}")
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
+        return
+
+    trainer.train(resume_from_checkpoint=resume)
+
+
+if __name__ == "__main__":
+    print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    os.environ.setdefault("HF_DATASETS_DISABLE_MULTIPROCESSING", "1")
+    os.environ.setdefault("WANDB_PROJECT", "dna-grpo-optB")
+
+    parser = TrlParser((GRPOScriptArgumentsOptB, DNALLMGRPOConfig, GRPOModelConfig))
+    script_args, training_args, model_args = parser.parse_args_and_config()
+    training_args.save_safetensors = False
+    training_args.vllm_server_base_url = os.environ.get("VLLM_BASE_URL")
+
+    main(script_args, training_args, model_args)
